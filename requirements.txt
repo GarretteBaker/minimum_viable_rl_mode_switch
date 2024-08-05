@@ -1,0 +1,22 @@
+tensorflow[cpu]
+tf_keras
+jax[cuda12_pip]
+distrax
+optax  
+flax
+numpy
+pre-commit
+argparse
+wandb
+orbax-checkpoint
+gymnax
+chex
+matplotlib
+imageio
+dm-haiku
+seaborn
+plotly==5.22.0
+scikit-learn
+einops
+
+--find-links https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
