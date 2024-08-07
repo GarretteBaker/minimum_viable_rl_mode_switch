@@ -8,9 +8,26 @@ from typing import Sequence, NamedTuple, Any
 from flax.training.train_state import TrainState
 import distrax
 from gymnax.wrappers.purerl import FlattenObservationWrapper, LogWrapper
+from jax.experimental import host_callback
 import matplotlib.pyplot as plt
+import einops
+from sgld_utils import run_sgld, SGLDConfig
 
 from color_streak import ColorStreak, EnvParams
+
+import orbax.checkpoint as ocp
+from flax.training import orbax_utils
+
+# Set up Orbax checkpointer (as before)
+checkpointer = ocp.PyTreeCheckpointer()
+options = ocp.CheckpointManagerOptions(max_to_keep=2, create=True)
+checkpoint_manager = ocp.CheckpointManager('C:/Users/garre/OneDrive/Documents/AI alignment-MirrorOfScrying/minimum_viable_rl_mode_switch/checkpoints', checkpointer, options)
+
+def save_checkpoint(args):
+    params, step = args
+    ckpt = {'params': params, 'step': int(step)}
+    save_args = orbax_utils.save_args_from_target(ckpt)
+    checkpoint_manager.save(int(step), ckpt, save_kwargs={'save_args': save_args})
 
 class ActorCritic(nn.Module):
     action_dim: Sequence[int]
@@ -153,6 +170,60 @@ def make_train(config):
             train_state, env_state, last_obs, rng = runner_state
             _, last_val = network.apply(train_state.params, last_obs)
 
+            lambdahat = None
+            mala = None
+            loss_trace = None
+            # # CALCULATE b-LLC
+            # sgld_config = SGLDConfig(
+            #     epsilon = 1e-4, 
+            #     gamma = 10, 
+            #     num_steps = 1e3, 
+            #     num_chains = 1, 
+            #     batch_size = 64
+            # )
+            # itemp = 1e-3
+
+            # def loss_fn(params, obsv, target):
+            #     pi, value = network.apply(params, obsv)
+            #     logits = pi.logits
+
+            #     pi_targets = targets[..., :-1]
+            #     value_targets = targets[..., -1]
+
+            #     pi_loss = jnp.linalg.norm(logits - pi_targets)**2
+            #     value_loss = jnp.linalg.norm(value - value_targets)**2
+            #     return jnp.sqrt(pi_loss + value_loss)
+
+            # obsv = traj_batch.obs
+            # obsv = einops.rearrange(obsv, "e s d -> (e s) d")
+            # pi, val = network.apply(train_state.params, obsv)
+            # logits = pi.logits
+
+            # targets = jnp.concatenate(
+            #     [
+            #         logits, 
+            #         jnp.expand_dims(
+            #             val, 
+            #             axis = -1
+            #         )
+            #     ], 
+            #     axis=-1
+            # )
+
+            # rng, sgld_rng = jax.random.split(rng)
+            # loss_trace, _, mala = run_sgld(
+            #     sgld_rng, 
+            #     loss_fn, 
+            #     sgld_config, 
+            #     train_state.params, 
+            #     obsv, 
+            #     targets, 
+            #     itemp = itemp
+            # )
+            # lambdahat = float(jnp.mean(loss_trace)) * traj_batch.obs.shape[0] * itemp
+            # mala = jnp.mean([e[1] for e in mala])
+
+
             def _calculate_gae(traj_batch, last_val):
                 def _get_advantages(gae_and_next_value, transition):
                     gae, next_value = gae_and_next_value
@@ -264,8 +335,27 @@ def make_train(config):
             metric = {
                 **traj_batch.info,
                 "optimal_action_rate": jnp.sum(optimal_actions) / (config["NUM_STEPS"] * config["NUM_ENVS"]),
-                "suboptimal_action_rate": jnp.sum(suboptimal_actions) / (config["NUM_STEPS"] * config["NUM_ENVS"])
-            }
+                "suboptimal_action_rate": jnp.sum(suboptimal_actions) / (config["NUM_STEPS"] * config["NUM_ENVS"]), 
+                "llc": lambdahat, 
+                "mala": mala, 
+                "loss trace": loss_trace
+            }            
+
+            # Checkpointing logic using host_callback
+            def checkpoint_if_needed(args):
+                params, step = args
+                host_callback.id_tap(
+                    lambda x, _: save_checkpoint(x),
+                    (params, step),
+                    result=()
+                )
+
+            jax.lax.cond(
+                update_step == config["CHECKPOINT_STEP"],
+                checkpoint_if_needed,
+                lambda _: None,
+                (train_state.params, update_step)
+            )
 
             runner_state = (train_state, env_state, last_obs, rng)
             new_epsilon = jnp.maximum(epsilon - epsilon_decay, final_epsilon)
@@ -275,8 +365,17 @@ def make_train(config):
         rng, _rng = jax.random.split(rng)
         initial_carry = ((train_state, env_state, obsv, _rng), initial_epsilon)
         (runner_state, _), metrics = jax.lax.scan(
-            _update_step, initial_carry, jnp.arange(config["NUM_UPDATES"])
+            _update_step, initial_carry, jnp.arange(config["NUM_UPDATES"], dtype=jnp.int32)
         )
+
+        # Save final checkpoint
+        final_step = config["NUM_UPDATES"] - 1
+        host_callback.id_tap(
+            lambda x, _: save_checkpoint(x),
+            (runner_state[0].params, final_step),
+            result=()
+        )
+
         return {"runner_state": runner_state, "metrics": metrics}
 
     return train
@@ -298,6 +397,7 @@ config = {
     "ACTIVATION": "tanh",
     "ENV_PARAMS": EnvParams(max_colors=2, optimal_reward=1.0, suboptimal_reward=0.25, max_steps_in_episode=10, required_streak=3),
     "ANNEAL_LR": True,
+    "CHECKPOINT_STEP": 4000,  # New configuration for the checkpoint step
 }
 
 # Create the training function
