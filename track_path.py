@@ -449,3 +449,8 @@ plt.savefig("simple_color_ppo_learning_curve.png")
 plt.close()
 
 print("Training complete. Learning curve saved as 'simple_color_ppo_learning_curve.png'")
+
+plt.plot(out["metrics"]["llc"])
+plt.title("llc over time")
+plt.tight_layout()
+plt.savefig("llc_over_time.png")
