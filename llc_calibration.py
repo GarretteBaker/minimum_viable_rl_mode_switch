@@ -168,25 +168,31 @@ def calculate_llc(params: dict, config: dict, env: ColorStreak, env_params: EnvP
         batch_size=batch_size
     )
 
-    def loss_fn(params, obsv, target):
+    def loss(params, obsv, target):
         pi, value = network.apply(params, obsv)
-        logits = pi.logits
+        logits = pi.probs
 
         pi_targets = target[..., :-1]
+        print(pi_targets.shape)
         value_targets = target[..., -1]
+        print(value_targets.shape)
 
         pi_loss = jnp.linalg.norm(logits - pi_targets)**2
         value_loss = jnp.linalg.norm(value - value_targets)**2
-        return jnp.sqrt(pi_loss + value_loss)
+        return pi_loss + value_loss
+    loss_fn = jax.jit(lambda param, input, target: loss(param, input, target))
 
     # Collect trajectory batch
     obsv = collect_trajectory_batch(params, env, env_params, config, network)
     obsv = einops.rearrange(obsv, "t e d -> (e t) d")
+    print(f"Observation shape: {obsv.shape}")
+    print(obsv)
 
     # Generate targets
     pi, val = network.apply(params, obsv)
-    logits = pi.logits
+    logits = pi.probs
     targets = jnp.concatenate([logits, jnp.expand_dims(val, axis=-1)], axis=-1)
+    print(f"Targets shape: {targets.shape}")
 
     rng = jax.random.PRNGKey(0)
     rng, sgld_rng = jax.random.split(rng)
@@ -200,6 +206,7 @@ def calculate_llc(params: dict, config: dict, env: ColorStreak, env_params: EnvP
         itemp=itemp
     )
     initial_loss = loss_fn(params, obsv, targets)
+    print(f"initial loss: {initial_loss}")
     lambdahat = float(np.mean(loss_trace)) * obsv.shape[0] * itemp
     mala = np.mean([e[1] for e in mala])
 
@@ -213,9 +220,9 @@ def hyperparams_test(checkpoint_dir: str, step: int, config: dict):
 
     model = load_model(checkpoint_dir, step)
 
-    epsilons = [1e-10]
+    epsilons = [1e-2]
     gammas = [10]
-    batches = [4]
+    batches = [64]
     itemps = [0.01]
     results = list()
 

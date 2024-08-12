@@ -17,7 +17,7 @@ from color_streak import ColorStreak, EnvParams
 
 import orbax.checkpoint as ocp
 from flax.training import orbax_utils
-
+from tqdm import tqdm
 # Set up Orbax checkpointer (as before)
 checkpointer = ocp.PyTreeCheckpointer()
 options = ocp.CheckpointManagerOptions(max_to_keep=2, create=True)
@@ -129,6 +129,7 @@ def make_train(config):
             runner_state, epsilon = carry
             
             # COLLECT TRAJECTORIES
+            @jax.jit
             def _env_step(runner_state, unused):
                 train_state, env_state, last_obs, rng = runner_state
 
@@ -173,57 +174,56 @@ def make_train(config):
             lambdahat = None
             mala = None
             loss_trace = None
-            # # CALCULATE b-LLC
-            # sgld_config = SGLDConfig(
-            #     epsilon = 1e-4, 
-            #     gamma = 10, 
-            #     num_steps = 1e3, 
-            #     num_chains = 1, 
-            #     batch_size = 64
-            # )
-            # itemp = 1e-3
+            # CALCULATE b-LLC
+            sgld_config = SGLDConfig(
+                epsilon = 1e-10, 
+                gamma = 10, 
+                num_steps = 1000, 
+                num_chains = 1, 
+                batch_size = 64
+            )
+            itemp = 1e-3
+            @jax.jit
+            def loss_fn(params, obsv, targets):
+                pi, value = network.apply(params, obsv)
+                logits = pi.logits
 
-            # def loss_fn(params, obsv, target):
-            #     pi, value = network.apply(params, obsv)
-            #     logits = pi.logits
+                pi_targets = targets[..., :-1]
+                value_targets = targets[..., -1]
 
-            #     pi_targets = targets[..., :-1]
-            #     value_targets = targets[..., -1]
+                pi_loss = jnp.linalg.norm(logits - pi_targets)**2
+                value_loss = jnp.linalg.norm(value - value_targets)**2
+                return jnp.sqrt(pi_loss + value_loss)
 
-            #     pi_loss = jnp.linalg.norm(logits - pi_targets)**2
-            #     value_loss = jnp.linalg.norm(value - value_targets)**2
-            #     return jnp.sqrt(pi_loss + value_loss)
+            obsv = traj_batch.obs
+            obsv = einops.rearrange(obsv, "e s d -> (e s) d")
+            pi, val = network.apply(train_state.params, obsv)
+            logits = pi.logits
 
-            # obsv = traj_batch.obs
-            # obsv = einops.rearrange(obsv, "e s d -> (e s) d")
-            # pi, val = network.apply(train_state.params, obsv)
-            # logits = pi.logits
+            targets = jnp.concatenate(
+                [
+                    logits, 
+                    jnp.expand_dims(
+                        val, 
+                        axis = -1
+                    )
+                ], 
+                axis=-1
+            )
+            rng, sgld_rng = jax.random.split(rng)
+            loss_trace, _, mala = run_sgld(
+                sgld_rng, 
+                loss_fn, 
+                sgld_config, 
+                train_state.params, 
+                obsv, 
+                targets, 
+                itemp = itemp
+            )
+            lambdahat = float(np.mean(loss_trace)) * traj_batch.obs.shape[0] * itemp
+            mala = np.mean([e[1] for e in mala])
 
-            # targets = jnp.concatenate(
-            #     [
-            #         logits, 
-            #         jnp.expand_dims(
-            #             val, 
-            #             axis = -1
-            #         )
-            #     ], 
-            #     axis=-1
-            # )
-
-            # rng, sgld_rng = jax.random.split(rng)
-            # loss_trace, _, mala = run_sgld(
-            #     sgld_rng, 
-            #     loss_fn, 
-            #     sgld_config, 
-            #     train_state.params, 
-            #     obsv, 
-            #     targets, 
-            #     itemp = itemp
-            # )
-            # lambdahat = float(jnp.mean(loss_trace)) * traj_batch.obs.shape[0] * itemp
-            # mala = jnp.mean([e[1] for e in mala])
-
-
+            @jax.jit
             def _calculate_gae(traj_batch, last_val):
                 def _get_advantages(gae_and_next_value, transition):
                     gae, next_value = gae_and_next_value
@@ -251,6 +251,7 @@ def make_train(config):
             advantages, targets = _calculate_gae(traj_batch, last_val)
 
             # UPDATE NETWORK
+            @jax.jit
             def _update_epoch(update_state, unused):
                 def _update_minbatch(train_state, batch_info):
                     traj_batch, advantages, targets = batch_info
@@ -364,9 +365,21 @@ def make_train(config):
 
         rng, _rng = jax.random.split(rng)
         initial_carry = ((train_state, env_state, obsv, _rng), initial_epsilon)
-        (runner_state, _), metrics = jax.lax.scan(
-            _update_step, initial_carry, jnp.arange(config["NUM_UPDATES"], dtype=jnp.int32)
-        )
+        # (runner_state, _), metrics = jax.lax.scan(
+        #     _update_step, initial_carry, jnp.arange(config["NUM_UPDATES"], dtype=jnp.int32)
+        # )
+        metrics = []
+
+        # Perform the equivalent of jax.lax.scan
+        runner_state = initial_carry
+        update_range = range(int(config["NUM_UPDATES"]))
+        for _ in tqdm(update_range):
+            runner_state, metric = _update_step(runner_state, None)
+            metrics.append(metric)
+
+        # Convert metrics to a numpy array (assuming metrics are numeric)
+        metrics = np.stack(metrics)
+        runner_state = runner_state[0]
 
         # Save final checkpoint
         final_step = config["NUM_UPDATES"] - 1
@@ -405,7 +418,7 @@ train_fn = make_train(config)
 
 # Run the training
 rng = jax.random.PRNGKey(0)
-out = jax.jit(train_fn)(rng)
+out = train_fn(rng)
 
 # Print the shape and content of the metrics
 returns = jnp.mean(out["metrics"]["returned_episode_returns"], axis=1)

@@ -75,7 +75,9 @@ def run_sgld(rngkey, loss_fn, sgld_config, param_init, x_train, y_train, itemp=N
     while t < sgld_config.num_steps:
         for x_batch, y_batch in create_minibatches(x_train, y_train, batch_size=sgld_config.batch_size):
             old_param = param.copy()
-            _, grads = sgld_grad_fn(param, x_batch, y_batch)
+            loss, grads = sgld_grad_fn(param, x_batch, y_batch)
+            # print(grads)
+            # print()
             updates, opt_state = sgldoptim.update(grads, opt_state)
             param = optax.apply_updates(param, updates)
             if compute_distance: 
